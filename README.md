@@ -56,32 +56,40 @@ This function is the script's most powerful tool, used only for the severe failu
 
 ## Installation & Usage
 
-1.  **Copy the Script:** Save the script's code to a file on your OpenWrt router, for example: `/root/cellular_watchdog.sh`.
-2.  **Make it Executable:** Connect to your router via SSH and run:
-    ```bash
-    chmod +x /root/cellular_watchdog.sh
-    ```
-3.  **Test It (Recommended):** Run the script from the command line to ensure the auto-detection works correctly on your system.
-    ```bash
-    # Start the script in the background
-    /root/cellular_watchdog.sh &
+This watchdog is designed to be run as a standard system service in OpenWrt.
 
-    # Watch its log output
+1.  **Copy the Files:**
+    -   Copy the main script, `connection_monitor.sh`, to `/usr/sbin/`.
+    -   Copy the init script, `connection_monitor`, to the `/etc/init.d/` directory on your router.
+
+2.  **Set Permissions:** Connect to your router via SSH and make both files executable:
+    ```bash
+    chmod +x /usr/sbin/connection_monitor.sh
+    chmod +x /etc/init.d/connection_monitor
+    ```
+3.  **Enable the Service:** Enable the service to make it start automatically every time your router boots.
+    ```bash
+    /etc/init.d/connection_monitor enable
+    ```
+4.  **Start the Service:** You can start the service for the first time without needing to reboot:
+    ```bash
+    /etc/init.d/connection_monitor start
+    ```
+5.  **Verify It's Running:** Watch its log output to see the auto-detection phase complete successfully. The script uses the log tag `CellularWatchdog` by default.
+    ```bash
     logread -f -e CellularWatchdog
     ```
-    The script should print a successful "Modem Auto-Detection Complete" block and then begin its monitoring cycle.
-4.  **Enable on Boot:** Once you are confident it works, make it start automatically.
-    -   Navigate to `System -> Startup` in the LuCI web interface.
-    -   Scroll down to the "Local Startup" text box.
-    -   Add the following line **before** the `exit 0` line:
-        ```
-        /root/cellular_watchdog.sh &
-        ```
-    -   Save and apply. The script will now start automatically every time your router boots.
+
+### Managing the Service
+
+You can now manage the watchdog like any other system service:
+-   **To stop the watchdog:** `/etc/init.d/connection_monitor stop`
+-   **To restart the watchdog:** `/etc/init.d/connection_monitor restart`
+-   **To disable it from starting on boot:** `/etc/init.d/connection_monitor disable`
 
 ## Configuration
 
-The script is designed to be fully automatic, but you can tweak these variables at the top of the file if needed:
+The script is designed to be fully automatic, but you can tweak these variables at the top of the `connection_monitor.sh` file if needed:
 -   `PING_HOST`: The IP address to ping for health checks. `8.8.8.8` is a reliable choice.
 -   `PING_COUNT`: The number of pings to send.
 -   `SLEEP_INTERVAL`: The number of seconds to wait between health checks when the connection is good.
@@ -90,7 +98,7 @@ The script is designed to be fully automatic, but you can tweak these variables 
 
 This script was developed and rigorously debugged in a collaborative effort:
 
--   **peterpt**: Lead Engineer, Testing, and Real-World Diagnostics
+-   **Peter (peterpt on GitHub)**: Lead Engineer, Testing, and Real-World Diagnostics
 -   **Google's Gemini Pro Model**: Code Generation, Initial Logic, and Debugging Assistance
 
 This project would have been impossible without the meticulous, step-by-step testing and insightful analysis provided by the lead engineer.

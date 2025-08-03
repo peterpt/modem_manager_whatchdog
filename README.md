@@ -90,7 +90,7 @@ The script is designed to be fully automatic, but you can tweak these variables 
 
 This script was developed and rigorously debugged in a collaborative effort:
 
--   **[Your GitHub Username]**: Lead Engineer, Testing, and Real-World Diagnostics
+-   **peterpt**: Lead Engineer, Testing, and Real-World Diagnostics
 -   **Google's Gemini Pro Model**: Code Generation, Initial Logic, and Debugging Assistance
 
 This project would have been impossible without the meticulous, step-by-step testing and insightful analysis provided by the lead engineer.

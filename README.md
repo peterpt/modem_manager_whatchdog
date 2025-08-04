@@ -1,5 +1,11 @@
 # Universal Cellular Watchdog for OpenWrt with ModemManager
 
+
+## Startup script image
+
+![Alt text](https://github.com/peterpt/modem_manager_whatchdog/blob/main/cewlularwatchdog.jpg)
+
+## Description
 This script is an intelligent, resilient watchdog for maintaining a stable cellular connection on OpenWrt routers using ModemManager. It automatically detects modem hardware, monitors the connection, and performs a series of escalating recovery actions—from a simple interface restart to a full firmware-level modem reset—to handle connection drops and specific hardware glitches like the "sim-missing" error.
 
 It was designed to be a "fire and forget" solution that requires no manual hardware configuration and is robust enough to handle permanent physical failures gracefully without quitting.

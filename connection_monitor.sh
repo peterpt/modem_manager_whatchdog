@@ -1,129 +1,148 @@
 #!/bin/sh
 
-# --- Universal Cellular Connection Watchdog ---
-# Version: 9.0 - "The Protocol-Aware" Edition. Now verifies that ModemManager is installed and in use before running.
-# This script automatically detects modem details and recovers from specific failures for ModemManager-based setups.
+# --- Universal Cellular Connection Watchdog & Failover Manager ---
+# Version: 28.0 - "The Commander's Intent" Edition. The definitive professional version.
+# This script operates as a complete, stateful failover manager and hardware medic
+# based on a clear, user-defined operational doctrine for maximum unattended reliability.
 
 # --- Configuration ---
 LOG_TAG="CellularWatchdog"
-PING_HOST="8.8.8.8"      # A reliable IP to test raw connectivity
+PING_HOST="8.8.8.8"
 PING_COUNT=4
-NORMAL_SLEEP_INTERVAL=60   # Seconds to wait when connection is good.
-LONG_SLEEP_INTERVAL=300  # 5 minutes. Seconds to wait when in a hard-fail state.
+NORMAL_SLEEP_INTERVAL=60  # The core 1-minute check interval
 REAPPEAR_TIMEOUT=120
+INITIAL_CONNECT_TIMEOUT=180 # 3 minutes
+FLAG_FILE="/tmp/cellular_watchdog.boot.flag"
+MAX_SOFT_RESETS=2
+MAX_FULL_RECOVERIES=2
+HIBERNATION_INTERVAL=3600 # 1 hour
+
+# --- Tool Path Variables ---
+# (Populated by initialize_tool_paths)
 
 # --- Auto-Detected & State Variables ---
 LOGICAL_INTERFACE=""
-MODEM_VID_PID=""
-AT_PORT=""
-LAST_ACTION="" # This variable will track the last major recovery action.
+PHYSICAL_DEVICE=""
+PRIMARY_WAN_IFACE=""
+PRIMARY_WAN_PHYSICAL_DEVICE=""
+MODEM_INDEX=""
+FULL_RECOVERY_COUNT=0
+SOFT_RESET_COUNT=0
 
 # --- Helper Functions ---
-
-detect_modem_details() {
-    logger -t "$LOG_TAG" "Attempting to auto-detect modem details..."
-
-    # --- NEW: Pre-flight checks to ensure this is a ModemManager system ---
-    logger -t "$LOG_TAG" "Performing pre-flight checks..."
-    if ! opkg list-installed | grep -q "modemmanager"; then
-        logger -t "$LOG_TAG" -p daemon.crit "PRE-FLIGHT CHECK FAILED: The 'modemmanager' package is not installed. This script is for ModemManager setups only. Exiting."
-        return 1
-    fi
-    if ! uci show network | grep -q "proto='modemmanager'"; then
-        logger -t "$LOG_TAG" -p daemon.crit "PRE-FLIGHT CHECK FAILED: No network interface is configured with 'proto=modemmanager'. Exiting."
-        return 1
-    fi
-    logger -t "$LOG_TAG" "Pre-flight checks passed. This is a ModemManager system."
-    # --- End of Pre-flight checks ---
-
-    local MODEM_INFO_FILE; MODEM_INFO_FILE=$(mktemp /tmp/modem_info.XXXXXX); trap 'rm -f "$MODEM_INFO_FILE"' EXIT
-    local detection_attempts=0; local MODEM_INDEX; MODEM_INDEX=$(mmcli -L | sed -n 's/.*\/Modem\/\([0-9]\+\).*/\1/p' | head -n 1)
-    if [ -z "$MODEM_INDEX" ]; then logger -t "$LOG_TAG" -p daemon.err "DETECTION FAILED: No modem found by ModemManager."; return 1; fi
-    logger -t "$LOG_TAG" "Found modem at index: $MODEM_INDEX. Waiting for it to be fully populated..."
-    while [ "$detection_attempts" -lt 15 ]; do
-        mmcli -m "$MODEM_INDEX" > "$MODEM_INFO_FILE"
-        if [ $? -eq 0 ] && grep -q "(at)" "$MODEM_INFO_FILE" && grep -q -w "System" "$MODEM_INFO_FILE"; then
-            logger -t "$LOG_TAG" "Modem at index $MODEM_INDEX is fully populated."; break
+find_tool() { local tool_name="$1"; for path in /bin /sbin /usr/bin /usr/sbin; do if [ -x "${path}/${tool_name}" ]; then echo "${path}/${tool_name}"; return 0; fi; done; command -v "$tool_name"; }
+get_physical_device() { local logical_iface="$1"; ubus call network.interface."$logical_iface" status 2>/dev/null | "$GREP_CMD" -o '"l3_device": *"[^"]*"' | "$CUT_CMD" -d'"' -f4; }
+initialize_tool_paths() {
+    logger -t "$LOG_TAG" "Initializing tool paths..."; MMCLI_CMD=$(find_tool mmcli); LSUSB_CMD=$(find_tool lsusb); AWK_CMD=$(find_tool awk); GREP_CMD=$(find_tool grep); SED_CMD=$(find_tool sed); HEAD_CMD=$(find_tool head); IP_CMD=$(find_tool ip); PING_CMD=$(find_tool ping); SERVICE_CMD=$(find_tool service); IFUP_CMD=$(find_tool ifup); IFDOWN_CMD=$(find_tool ifdown); TOUCH_CMD=$(find_tool touch); CUT_CMD=$(find_tool cut); CAT_CMD=$(find_tool cat); MKTEMP_CMD=$(find_tool mktemp); ECHO_CMD=$(find_tool echo); RM_CMD=$(find_tool rm); SLEEP_CMD=$(find_tool sleep); UCI_CMD=$(find_tool uci)
+    for cmd_var in MMCLI_CMD LSUSB_CMD AWK_CMD GREP_CMD SED_CMD HEAD_CMD PING_CMD SERVICE_CMD IFUP_CMD IFDOWN_CMD TOUCH_CMD CUT_CMD CAT_CMD MKTEMP_CMD ECHO_CMD RM_CMD SLEEP_CMD UCI_CMD IP_CMD; do
+        eval "local cmd_path=\$$cmd_var"; if [ -z "$cmd_path" ]; then local tool_name; tool_name=$("$ECHO_CMD" "$cmd_var" | "$SED_CMD" 's/_CMD$//' | tr 'A-Z' 'a-z'); logger -t "$LOG_TAG" -p daemon.crit "DEPENDENCY ERROR: Could not find required tool '$tool_name'. Exiting."; return 1; fi
+    done; logger -t "$LOG_TAG" "All tool paths initialized successfully."; return 0
+}
+detect_interfaces() {
+    # This function just gets names. It doesn't require a connection.
+    LOGICAL_INTERFACE=$("$UCI_CMD" show network | "$GREP_CMD" "proto='modemmanager'" | "$HEAD_CMD" -n 1 | "$CUT_CMD" -d'.' -f2)
+    PRIMARY_WAN_IFACE=""
+    local wan_zone_networks; wan_zone_networks=$("$UCI_CMD" get firewall.@zone[1].network 2>/dev/null)
+    for iface in $wan_zone_networks; do
+        if [ "$iface" != "$LOGICAL_INTERFACE" ]; then
+            PRIMARY_WAN_IFACE="$iface"
+            break
         fi
-        detection_attempts=$((detection_attempts + 1)); sleep 2
     done
-    if ! [ -s "$MODEM_INFO_FILE" ] || ! grep -q "(at)" "$MODEM_INFO_FILE"; then
-        logger -t "$LOG_TAG" -p daemon.err "DETECTION FAILED: Modem never populated its details."; return 1
-    fi
-    AT_PORT=$(grep '(at)' "$MODEM_INFO_FILE" | head -n 1 | awk '{print $2}'); AT_PORT="/dev/${AT_PORT}"
-    if [ ! -c "$AT_PORT" ]; then logger -t "$LOG_TAG" -p daemon.err "DETECTION FAILED: AT port '$AT_PORT' is not a valid device."; return 1; fi
-    local SYSFS_PATH; SYSFS_PATH=$(grep -w "System" "$MODEM_INFO_FILE" | awk '{print $4}')
-    if [ ! -d "$SYSFS_PATH" ]; then logger -t "$LOG_TAG" -p daemon.err "DETECTION FAILED: sysfs path '$SYSFS_PATH' not found."; return 1; fi
-    local ID_VENDOR; local ID_PRODUCT; ID_VENDOR=$(cat "$SYSFS_PATH/idVendor"); ID_PRODUCT=$(cat "$SYSFS_PATH/idProduct")
-    MODEM_VID_PID="${ID_VENDOR}:${ID_PRODUCT}"
-    if [ -z "$MODEM_VID_PID" ] || [ "$MODEM_VID_PID" = ":" ]; then logger -t "$LOG_TAG" -p daemon.err "DETECTION FAILED: Could not read VID:PID."; return 1; fi
-    LOGICAL_INTERFACE=$(uci show network | grep "proto='modemmanager'" | head -n 1 | cut -d'.' -f2)
-    if [ -z "$LOGICAL_INTERFACE" ]; then logger -t "$LOG_TAG" -p daemon.err "DETECTION FAILED: No ModemManager interface in UCI config."; return 1; fi
-    logger -t "$LOG_TAG" -p daemon.notice "=== Modem Auto-Detection Complete ==="
-    logger -t "$LOG_TAG" "Logical Interface: $LOGICAL_INTERFACE"; logger -t "$LOG_TAG" "Modem VID:PID:     $MODEM_VID_PID"; logger -t "$LOG_TAG" "AT Command Port:   $AT_PORT"
-    logger -t "$LOG_TAG" "====================================="
+    if [ -z "$LOGICAL_INTERFACE" ]; then return 1; else return 0; fi
+}
+get_modem_details_for_recovery() {
+    # This special function is called only when a recovery is needed.
+    MODEM_INDEX=$("$MMCLI_CMD" -L | "$GREP_CMD" -o '/Modem/[0-9]*' | "$AWK_CMD" -F'/' '{print $3}' | "$HEAD_CMD" -n 1)
+    if [ -z "$MODEM_INDEX" ]; then return 1; fi
+
+    local MODEM_INFO_FILE; MODEM_INFO_FILE=$("$MKTEMP_CMD" /tmp/recovery_info.XXXXXX); trap ''$RM_CMD' -f "$MODEM_INFO_FILE"' EXIT
+    "$MMCLI_CMD" -m "$MODEM_INDEX" > "$MODEM_INFO_FILE"
+    if ! [ -s "$MODEM_INFO_FILE" ]; then return 1; fi
+
+    AT_PORT=$("$GREP_CMD" '(at)' "$MODEM_INFO_FILE" | "$HEAD_CMD" -n 1 | "$AWK_CMD" '{print $2}'); AT_PORT="/dev/${AT_PORT}"
+    local SYSFS_PATH; SYSFS_PATH=$("$GREP_CMD" -w "System" "$MODEM_INFO_FILE" | "$AWK_CMD" '{print $4}')
+    if [ ! -d "$SYSFS_PATH" ]; then return 1; fi
+    local ID_VENDOR; local ID_PRODUCT; ID_VENDOR=$("$CAT_CMD" "$SYSFS_PATH/idVendor"); ID_PRODUCT=$("$CAT_CMD" "$SYSFS_PATH/idProduct"); MODEM_VID_PID="${ID_VENDOR}:${ID_PRODUCT}"
     return 0
 }
-
 perform_full_recovery() {
-    logger -t "$LOG_TAG" -p daemon.warn "=== Starting Full Modem Recovery ==="; service modemmanager stop; sleep 5
-    echo -e "AT+CFUN=1,1\r" > "$AT_PORT"
-    logger -t "$LOG_TAG" "Waiting up to $REAPPEAR_TIMEOUT seconds for modem ($MODEM_VID_PID) to reappear..."
-    local wait_time=0; local modem_reappeared=false
-    while [ "$wait_time" -lt "$REAPPEAR_TIMEOUT" ]; do
-        if lsusb -d "$MODEM_VID_PID" >/dev/null 2>&1; then
-            logger -t "$LOG_TAG" -p daemon.notice "SUCCESS: Modem has reappeared."; modem_reappeared=true; break
-        fi
-        sleep 5; wait_time=$((wait_time + 5))
-    done
-    if ! $modem_reappeared; then logger -t "$LOG_TAG" -p daemon.err "FATAL: Modem did not reappear."; LAST_ACTION="FATAL_HW"; return 1; fi
-    service modemmanager start; logger -t "$LOG_TAG" "Waiting 45 seconds for ModemManager..."; sleep 45
-    logger -t "$LOG_TAG" "Bringing up interface '$LOGICAL_INTERFACE'..."; ifup "$LOGICAL_INTERFACE"
-    logger -t "$LOG_TAG" "=== Full Modem Recovery Attempt Finished ==="
+    if ! get_modem_details_for_recovery; then logger -t "$LOG_TAG" -p daemon.err "Full Recovery Fail: Cannot get modem details for reset."; FULL_RECOVERY_COUNT=$((FULL_RECOVERY_COUNT+1)); return; fi
+    logger -t "$LOG_TAG" -p daemon.warn "=== Starting Full Modem Recovery (Attempt #$((FULL_RECOVERY_COUNT + 1)) of $MAX_FULL_RECOVERIES) ==="; "$SERVICE_CMD" modemmanager stop; "$SLEEP_CMD" 5; "$ECHO_CMD" -e "AT+CFUN=1,1\r" > "$AT_PORT";
+    local wait_time=0; local modem_reappeared=false; while [ "$wait_time" -lt "$REAPPEAR_TIMEOUT" ]; do if "$LSUSB_CMD" -d "$MODEM_VID_PID" >/dev/null 2>/dev/null; then modem_reappeared=true; break; fi; "$SLEEP_CMD" 5; wait_time=$((wait_time + 5)); done
+    if ! $modem_reappeared; then logger -t "$LOG_TAG" -p daemon.err "FATAL: Modem did not reappear after full reset."; FULL_RECOVERY_COUNT=$((FULL_RECOVERY_COUNT + 1)); return; fi
+    "$SERVICE_CMD" modemmanager start; "$SLEEP_CMD" 45; "$IFUP_CMD" "$LOGICAL_INTERFACE";
 }
 
-
 # --- Main Script Execution ---
-if ! detect_modem_details; then
-    logger -t "$LOG_TAG" -p daemon.crit "Initial modem detection failed. Watchdog cannot run."; exit 1
-fi
-logger -t "$LOG_TAG" "Watchdog started. Monitoring interface '$LOGICAL_INTERFACE'."
+if ! initialize_tool_paths; then exit 1; fi
+logger -t "$LOG_TAG" "Autonomous Failover Engine started."
 
 # --- Main Monitoring Loop ---
 while true; do
-    if ping -c "$PING_COUNT" -W 5 "$PING_HOST" >/dev/null 2>&1; then
-        if [ -n "$LAST_ACTION" ]; then
-            logger -t "$LOG_TAG" -p daemon.notice "Connection restored. Returning to normal monitoring."
-            LAST_ACTION=""
-        fi
-        sleep "$NORMAL_SLEEP_INTERVAL"
+    # --- Always detect basic interface names first ---
+    if ! detect_interfaces; then
+        logger -t "$LOG_TAG" -p daemon.warn "Could not detect configured interfaces. Waiting..."
     else
-        logger -t "$LOG_TAG" -p daemon.warn "Ping failed. Analyzing modem state..."
-        local CURRENT_MODEM_INDEX; CURRENT_MODEM_INDEX=$(mmcli -L | sed -n 's/.*\/Modem\/\([0-9]\+\).*/\1/p' | head -n 1)
-        if [ -z "$CURRENT_MODEM_INDEX" ]; then
-            logger -t "$LOG_TAG" -p daemon.err "Modem not found. Assuming hardware glitch."; perform_full_recovery
-            LAST_ACTION="RECOVERY"
-            sleep "$NORMAL_SLEEP_INTERVAL"
+        # --- The Boot Gate: Patiently wait on first run ---
+        if [ ! -f "$FLAG_FILE" ]; then
+            logger -t "$LOG_TAD" -p daemon.notice "First run since boot. Patiently monitoring for up to $INITIAL_CONNECT_TIMEOUT seconds..."
+            "$TOUCH_CMD" "$FLAG_FILE"
+            wait_init=0; initially_connected=false
+            while [ "$wait_init" -lt "$INITIAL_CONNECT_TIMEOUT" ]; do
+                PRIMARY_WAN_PHYSICAL_DEVICE=$(get_physical_device "$PRIMARY_WAN_IFACE")
+                if [ -n "$PRIMARY_WAN_IFACE" ] && "$IP_CMD" -4 addr show "$PRIMARY_WAN_PHYSICAL_DEVICE" 2>/dev/null | "$GREP_CMD" -q "inet"; then initially_connected=true; break; fi
+                PHYSICAL_DEVICE=$(get_physical_device "$LOGICAL_INTERFACE")
+                if "$IP_CMD" -4 addr show "$PHYSICAL_DEVICE" 2>/dev/null | "$GREP_CMD" -q "inet"; then initially_connected=true; break; fi
+                "$SLEEP_CMD" 10; wait_init=$((wait_init + 10))
+            done
+            if $initially_connected; then logger -t "$LOG_TAG" "Initial connection detected. Proceeding with active monitoring."; else logger -t "$LOG_TAG" -p daemon.warn "Initial connection not detected within timeout. Watchdog will now take active measures."; fi
+        fi
+
+        # --- Active Monitoring State Machine ---
+        PRIMARY_WAN_PHYSICAL_DEVICE=$(get_physical_device "$PRIMARY_WAN_IFACE")
+        primary_is_up=false
+        if [ -n "$PRIMARY_WAN_IFACE" ] && "$IP_CMD" -4 addr show "$PRIMARY_WAN_PHYSICAL_DEVICE" 2>/dev/null | "$GREP_CMD" -q "inet"; then
+            primary_is_up=true
+        fi
+
+        if $primary_is_up; then
+            logger -t "$LOG_TAG" "Primary WAN ('$PRIMARY_WAN_IFACE') is online. System stable. Resetting counters."
+            FULL_RECOVERY_COUNT=0; SOFT_RESET_COUNT=0
+            if ubus call network.interface."$LOGICAL_INTERFACE" status 2>/dev/null | "$GREP_CMD" -q '"up": true'; then
+                logger -t "$LOG_TAG" -p daemon.notice "Deactivating backup modem ('$LOGICAL_INTERFACE')."
+                "$IFDOWN_CMD" "$LOGICAL_INTERFACE"
+            fi
         else
-            local MODEM_STATUS; MODEM_STATUS=$(mmcli -m "$CURRENT_MODEM_INDEX")
-            if echo "$MODEM_STATUS" | grep -q "reason: sim-missing"; then
-                if [ "$LAST_ACTION" = "RECOVERY_SIM_MISSING" ]; then
-                    logger -t "$LOG_TAG" -p daemon.warn "CRITICAL: 'sim-missing' persists after recovery. This requires physical action. Entering long-term monitoring mode."
-                    sleep "$LONG_SLEEP_INTERVAL"
+            # Primary WAN is down. Modem must be our connection.
+            if [ -n "$PRIMARY_WAN_IFACE" ]; then logger -t "$LOG_TAG" -p daemon.warn "FAILOVER: Primary WAN is down. Managing backup modem."; fi
+            
+            PHYSICAL_DEVICE=$(get_physical_device "$LOGICAL_INTERFACE")
+            if ! ("$IP_CMD" -4 addr show "$PHYSICAL_DEVICE" 2>/dev/null | "$GREP_CMD" -q "inet"); then
+                # Modem is down. We must take action.
+                logger -t "$LOG_TAG" -p daemon.warn "Modem interface has no IP. Starting recovery."
+                if [ "$FULL_RECOVERY_COUNT" -ge "$MAX_FULL_RECOVERIES" ]; then
+                    logger -t "$LOG_TAG" -p daemon.crit "CRITICAL: Maximum full recovery failures reached. Hibernating for $HIBERNATION_INTERVAL seconds..."
+                    "$SLEEP_CMD" "$HIBERNATION_INTERVAL"
+                    logger -t "$LOG_TAG" "Hibernation finished. Resetting counter and retrying."
+                    FULL_RECOVERY_COUNT=0; SOFT_RESET_COUNT=0
                 else
-                    logger -t "$LOG_TAG" -p daemon.err "DIAGNOSIS: Modem reports 'sim-missing'. Starting full recovery."
-                    perform_full_recovery
-                    LAST_ACTION="RECOVERY_SIM_MISSING"
-                    sleep "$NORMAL_SLEEP_INTERVAL"
+                    if [ "$SOFT_RESET_COUNT" -ge "$MAX_SOFT_RESETS" ]; then
+                        perform_full_recovery
+                        SOFT_RESET_COUNT=0 # Reset soft counter after escalating
+                    else
+                        logger -t "$LOG_TAG" -p daemon.notice "Attempting soft restart (Attempt #$((SOFT_RESET_COUNT + 1)) of $MAX_SOFT_RESETS).";
+                        "$IFDOWN_CMD" "$LOGICAL_INTERFACE" && "$SLEEP_CMD" 10 && "$IFUP_CMD" "$LOGICAL_INTERFACE"
+                        SOFT_RESET_COUNT=$((SOFT_RESET_COUNT + 1))
+                    fi
                 fi
             else
-                logger -t "$LOG_TAG" -p daemon.notice "DIAGNOSIS: Standard drop. Attempting soft restart of '$LOGICAL_INTERFACE'."; ifdown "$LOGICAL_INTERFACE" && sleep 10 && ifup "$LOGICAL_INTERFACE"
-                LAST_ACTION="SOFT_RESET"
-                sleep "$NORMAL_SLEEP_INTERVAL"
+                # Modem is up and has an IP. Reset counters.
+                logger -t "$LOG_TAG" "Modem is online with IP. Monitoring connection."
+                FULL_RECOVERY_COUNT=0; SOFT_RESET_COUNT=0
             fi
         fi
     fi
+    
+    "$SLEEP_CMD" "$NORMAL_SLEEP_INTERVAL"
 done
-    
-
-    

@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # --- Universal Cellular Connection Watchdog & Failover Manager ---
-# Version: 28.0 - "The Commander's Intent" Edition. The definitive professional version.
+# Version: 1.0 - "The Commander's Intent" Edition. The definitive professional version.
 # This script operates as a complete, stateful failover manager and hardware medic
 # based on a clear, user-defined operational doctrine for maximum unattended reliability.
 

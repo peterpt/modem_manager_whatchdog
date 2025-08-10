@@ -1,106 +1,188 @@
-# Universal Cellular Watchdog for OpenWrt with ModemManager
+# Universal Cellular Connection Watchdog & Failover Manager with ModemManager
 
 
 ## Startup script image
 
 ![Alt text](https://github.com/peterpt/modem_manager_whatchdog/blob/main/cewlularwatchdog.jpg)
 
-## Description
-This script is an intelligent, resilient watchdog for maintaining a stable cellular connection on OpenWrt routers using ModemManager. It automatically detects modem hardware, monitors the connection, and performs a series of escalating recovery actions—from a simple interface restart to a full firmware-level modem reset—to handle connection drops and specific hardware glitches like the "sim-missing" error.
+Universal Cellular Connection Watchdog & Failover Manager
 
-It was designed to be a "fire and forget" solution that requires no manual hardware configuration and is robust enough to handle permanent physical failures gracefully without quitting.
+![alt text](https://img.shields.io/badge/Made%20for-OpenWrt-007186?style=for-the-badge&logo=openwrt)
 
-## Key Features
+This script is a complete, stateful failover manager and hardware medic designed for maximum unattended reliability on OpenWrt systems using modemmanager.
 
-- **Protocol-Aware:** Performs "pre-flight checks" to ensure `modemmanager` is installed and configured on an interface before running. It will not run on unsupported systems (e.g., QMI or NCM native setups).
-- **Universal Auto-Detection:** Automatically detects the modem's Vendor/Product ID, AT command port, and logical interface name at startup.
-- **Intelligent Triage:** Differentiates between simple connection drops, critical `sim-missing` errors, and unrecoverable hardware failures.
-- **Patient & Resilient:** If a critical error (like a missing SIM) persists after a full recovery attempt, the script does not exit or enter a fast loop. Instead, it transitions to a long-term, low-intensity monitoring mode, patiently waiting for the physical issue to be resolved by the user.
-- **Robust Recovery:** Employs a proven "Golden Recipe" of a firmware-level reset (`AT+CFUN=1,1`) followed by a ModemManager service restart to recover from otherwise fatal modem glitches.
-- **Efficient & Stable:** Built with robust, event-driven logic and optimized text-parsing to be reliable and lightweight. It uses a temporary file for efficient analysis, running complex commands only once per check.
-- **Detailed Logging:** Provides clear, tagged logs via `logread` for easy troubleshooting, using the tag `CellularWatchdog`.
+It goes far beyond a simple ping test. It understands the concept of a primary WAN and a backup cellular connection, actively managing the state of both. When the primary connection fails, it ensures the cellular modem is active and healthy. If the modem itself becomes unresponsive, it initiates a sophisticated, multi-tiered recovery protocol that ranges from a soft interface reset to a full hardware-level power cycle.
+Core Features
 
-## How It Works
+    Automatic Failover: Actively monitors a primary WAN connection. If it goes down, the script ensures the backup cellular modem takes over.
 
-The script operates in two main phases: an initial auto-detection phase and a continuous monitoring loop.
+    Stateful Monitoring: It's not just a script that runs every minute; it's an engine that understands the system's state. It knows if the primary WAN is active, if the modem should be active, and what to do in each scenario.
 
-### Phase 1: Startup & Auto-Detection (`detect_modem_details` function)
+    Multi-Tiered Recovery Protocol: If the modem fails to connect, it doesn't just reboot the system. It follows a clear, escalating doctrine:
 
-When the script first starts, it runs this function to learn about the hardware it's supposed to manage.
+        Level 1 (Soft Reset): Attempts to restart the network interface (ifdown/ifup).
 
-1.  **Pre-flight Check:** It first verifies that the `modemmanager` package is installed and that at least one network interface is configured with `proto='modemmanager'`. If not, it exits gracefully.
-2.  **Find Modem Index:** It asks ModemManager (`mmcli -L`) for a list of available modems and extracts the index of the first one (e.g., `0`).
-3.  **Create Temporary Workspace:** It creates a secure, unique temporary file in `/tmp` to store the modem's detailed information. This is done for efficiency, so the `mmcli -m` command is only run once per detection cycle.
-4.  **"Intelligent Wait" for Full Initialization:** The script enters a loop, repeatedly checking the modem's status. It only proceeds when it confirms that ModemManager has fully populated all the necessary details (specifically, the `(at)` port and `System` information), preventing race conditions during startup.
-5.  **Parse "Ground Truth" Data:** Once the modem is fully ready, the script parses the temporary file to set its operational variables:
-    -   **`AT_PORT`:** It robustly finds the line containing `(at)` and extracts the correct device name (e.g., `ttyUSB2`), then constructs the full path (`/dev/ttyUSB2`).
-    -   **`SYSFS_PATH`:** It finds the `System` line and extracts the device's system path.
-    -   **`MODEM_VID_PID`:** Using the `SYSFS_PATH`, it reads the `idVendor` and `idProduct` files to get the modem's true hardware ID (e.g., `2c7c:0125`), which is used for hardware-level checks.
-    -   **`LOGICAL_INTERFACE`:** It inspects the OpenWrt UCI configuration (`uci show network`) to find the name of the network interface that uses the `modemmanager` protocol (e.g., `4G_Modem`, `wan`).
+        Level 2 (Full Hardware Reset): If soft resets fail, it stops modemmanager, issues a direct AT+CFUN=1,1 command to the modem for a full reboot, waits for the USB device to reappear, and then cleanly restarts the services.
 
-### Phase 2: The Main Monitoring Loop (`while true`)
+        Level 3 (Hibernation): If multiple hardware resets fail, the script enters a long "hibernation" period to prevent a destructive reset loop, allowing external network issues to resolve.
 
-After the detection phase succeeds, the script enters its main infinite loop, which is the "heartbeat" of the watchdog.
+    Intelligent Boot-Up: On first run after a system boot, the script enters a patient monitoring mode, allowing time for interfaces to come up normally before taking any action.
 
-1.  **Health Check:** It pings a reliable IP address (`8.8.8.8`).
-2.  **If Ping Succeeds:** The connection is healthy. The script clears any previous failure flags and sleeps for the normal interval (e.g., 60 seconds).
-3.  **If Ping Fails:** The script logs the failure and begins its diagnostic triage:
-    -   It first checks the modem status via `mmcli`.
-    -   **If `sim-missing` error:** The script checks if it has *already* tried a full recovery for this specific error.
-        -   If it has, it assumes the problem is physical. It logs a critical message and enters a **long-term monitoring mode**, sleeping for a much longer interval (e.g., 5 minutes). It will not attempt another disruptive recovery until the `sim-missing` state changes.
-        -   If this is the first time seeing the error, it attempts the `perform_full_recovery` function and sets a flag to remember this action.
-    -   **For any other error:** The script assumes a "soft failure." It attempts the simplest fix: restarting the logical interface (`ifdown` and `ifup`).
+    Dynamic Detection: Automatically detects your modem's logical interface, AT port, and USB Vendor/Product ID for use in recovery actions.
 
-### The Full Recovery Protocol (The `perform_full_recovery` function)
+    System Integration: Designed specifically for OpenWrt, using uci for configuration detection and logger for clean integration with the system log (logread).
 
-This function is the script's most powerful tool, used only for the most severe failures.
+How It Works: The Operational Doctrine
 
-1.  **Stop Service:** It stops ModemManager (`service modemmanager stop`).
-2.  **Hardware Firmware Reset:** It sends the `AT+CFUN=1,1` command directly to the detected AT port.
-3.  **Intelligent Hardware Wait:** It polls `lsusb` every few seconds, waiting for the modem device to reappear on the USB bus.
-4.  **Start Service:** Once the hardware is back, it starts ModemManager fresh (`service modemmanager start`).
-5.  **Wait for Initialization:** It waits a generous 45 seconds for ModemManager to initialize the newly reset modem.
-6.  **Give "Green Light":** Finally, it runs `ifup` on the logical interface to command the modem to connect.
+The script runs in a continuous loop, acting as a state machine:
 
-## Installation & Usage
+    Check Primary WAN: It first checks if your primary wired WAN (e.g., wan) has an active internet connection.
 
-This watchdog is designed to be run as a standard system service in OpenWrt.
+    State: Primary is UP
 
-1.  **Copy the Files:**
-    -   Copy the main script, `connection_monitor.sh`, to `/usr/sbin/`.
-    -   Copy the init script, `connection_monitor`, to the `/etc/init.d/` directory on your router.
+        The system is stable.
 
-2.  **Set Permissions:** Connect to your router via SSH and make both files executable:
-    ```bash
-    chmod +x /usr/sbin/connection_monitor.sh
+        If the backup modem interface is currently active, it will be brought down to save data and power.
+
+        All error and reset counters are reset to zero.
+
+    State: Primary is DOWN (Failover Mode)
+
+        The script logs that a failover event is occurring.
+
+        It then checks the status of the backup cellular modem interface.
+
+        If the modem has a valid IP: The failover is successful. All error counters are reset. The script continues to monitor.
+
+        If the modem is down (no IP): The script initiates the Recovery Protocol.
+
+The Recovery Protocol in Detail
+
+    Soft Reset: The script will first attempt a "soft" reset by taking the modem interface down and then bringing it back up. It will try this MAX_SOFT_RESETS times.
+
+    Full Hardware Reset: If soft resets are exhausted, it escalates. It finds the modem's hardware details, sends it a direct hardware reset command (AT+CFUN=1,1), and waits for the hardware to fully re-initialize before restarting the interface. It will attempt this MAX_FULL_RECOVERIES times.
+
+    Hibernation: If even the hardware resets fail, the script assumes a critical, persistent failure. It hibernates for HIBERNATION_INTERVAL (default: 1 hour) to avoid causing more problems. After hibernating, it resets the counters and starts the process anew.
+
+Prerequisites
+
+This script is designed for OpenWrt and requires the following packages to be installed:
+
+    modemmanager (and its dependencies)
+
+    grep
+
+    sed
+
+    cut
+
+    coreutils-sleep
+
+    coreutils-touch
+
+    coreutils-rm
+
+    coreutils-echo
+
+    coreutils-head
+
+    coreutils-cat
+
+    coreutils-mktemp
+
+    usbutils (for lsusb)
+
+You can install them using opkg:
+code Sh
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+
+      
+opkg update
+opkg install modemmanager usbutils coreutils-sleep coreutils-touch coreutils-rm coreutils-echo coreutils-head coreutils-cat coreutils-mktemp
+
+    
+
+(Most other tools are typically included in the base system).
+Installation
+
+This project consists of two files: the main script (connection_monitor.sh) and the service script (init.d/connection_monitor).
+
+    SSH into your OpenWrt router.
+
+    Copy the connection_monitor.sh script from this repository to /usr/sbin/ on your router.
+
+    Make the script executable:
+    code Sh
+
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+
+      
+chmod +x /usr/sbin/connection_monitor.sh
+
+    
+
+Copy the init.d/connection_monitor service script from this repository to /etc/init.d/ on your router.
+
+Make the service script executable:
+code Sh
+
+    IGNORE_WHEN_COPYING_START
+    IGNORE_WHEN_COPYING_END
+
+          
     chmod +x /etc/init.d/connection_monitor
-    ```
-3.  **Enable the Service:** Enable the service to make it start automatically every time your router boots.
-    ```bash
-    /etc/init.d/connection_monitor enable
-    ```
-4.  **Start the Service:** You can start the service for the first time without needing to reboot:
-    ```bash
-    /etc/init.d/connection_monitor start
-    ```
-5.  **Verify It's Running:** Watch its log output to see the auto-detection phase complete successfully. The script uses the log tag `CellularWatchdog` by default.
-    ```bash
-    logread -f -e CellularWatchdog
-    ```
 
-### Managing the Service
+        
 
-You can now manage the watchdog like any other system service:
--   **To stop the watchdog:** `/etc/init.d/connection_monitor stop`
--   **To restart the watchdog:** `/etc/init.d/connection_monitor restart`
--   **To disable it from starting on boot:** `/etc/init.d/connection_monitor disable`
+Configuration
 
-## Configuration
+All configuration is done by editing the variables at the top of the /usr/sbin/connection_monitor.sh script.
+Variable	Default	Description
+LOG_TAG	"CellularWatchdog"	The tag used for logging. View logs with logread -e "CellularWatchdog".
+NORMAL_SLEEP_INTERVAL	60	The main check interval in seconds (default is 1 minute).
+INITIAL_CONNECT_TIMEOUT	180	On first boot, how long (in seconds) to wait for a connection before taking action.
+MAX_SOFT_RESETS	2	Number of ifdown/ifup attempts before escalating to a full hardware reset.
+MAX_FULL_RECOVERIES	2	Number of full hardware reset attempts before escalating to a hibernation.
+HIBERNATION_INTERVAL	3600	How long (in seconds) to pause all actions if max recoveries fail (default is 1 hour).
+Activating the Service
 
-The script is designed to be fully automatic, but you can tweak these variables at the top of `connection_monitor.sh` if needed:
--   `PING_HOST`: The IP address to ping for health checks. `8.8.8.8` is a reliable choice.
--   `NORMAL_SLEEP_INTERVAL`: The number of seconds to wait between health checks when the connection is good.
--   `LONG_SLEEP_INTERVAL`: The number of seconds to wait between checks when the script has detected a persistent physical problem (like a missing SIM).
+Once the files are copied and configured, you need to enable and start the service.
+
+Enable the service to ensure it starts automatically every time your router boots:
+code Sh
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+
+      
+service connection_monitor enable
+
+    
+
+Start the service for the first time:
+code Sh
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+
+      
+service connection_monitor start
+
+    
+
+Monitoring and Usage
+
+You can monitor the watchdog's activity by reading the system log and filtering by the LOG_TAG defined in the script's configuration.
+code Sh
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+
+      
+# View the live log as it happens
+logread -f -e "CellularWatchdog"
+
+# View all past log entries from the watchdog
+logread -e "CellularWatchdog"
 
 ## Authors & Acknowledgements
 
